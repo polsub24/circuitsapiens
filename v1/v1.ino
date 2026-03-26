@@ -13,8 +13,11 @@
 #define IN4 32
 
 // ---------------- ULTRASONIC ----------------
-#define TRIG 5
-#define ECHO 18
+#define TRIG_L 5
+#define ECHO_L 18
+
+#define TRIG_R 13
+#define ECHO_R 14
 
 // ---------------- MPU ----------------
 #define MPU_ADDR 0x68
@@ -34,6 +37,7 @@ typedef struct {
   int distance;
   bool emergency;
   uint8_t vehicleID;
+  unsigned long timestamp;   // ADD THIS
 } VehicleData;
 
 VehicleData myData, otherVehicle;
@@ -51,6 +55,10 @@ float alpha = 0.7;
 #define N 5
 float distBuffer[N];
 int idx = 0;
+
+bool isDataFresh(){
+  return (millis() - otherVehicle.timestamp) < 200;
+}
 
 // ------------MAGNETOMETER----------------
 float offsetX = -150;
@@ -148,12 +156,13 @@ float getHeading(int16_t ax,int16_t ay,int16_t az){
 }
 
 // ---------------- DISTANCE ----------------
-long readUltrasonic(){
-  digitalWrite(TRIG,LOW); delayMicroseconds(2);
-  digitalWrite(TRIG,HIGH); delayMicroseconds(10);
-  digitalWrite(TRIG,LOW);
-  long duration = pulseIn(ECHO,HIGH,20000);
-  return duration*0.034/2;
+long readUltrasonic(int trig, int echo){
+  digitalWrite(trig,LOW); delayMicroseconds(2);
+  digitalWrite(trig,HIGH); delayMicroseconds(10);
+  digitalWrite(trig,LOW);
+
+  long duration = pulseIn(echo,HIGH,20000);
+  return duration * 0.034 / 2;
 }
 
 float getDistance(){
@@ -161,10 +170,15 @@ float getDistance(){
   lox.rangingTest(&m,false);
 
   int tof = (m.RangeStatus!=4)? m.RangeMilliMeter/10 : 999;
-  int ultra = readUltrasonic();
+  return movingAverage(tof);
+}
 
-  float fused = (0.9*tof + 0.6*ultra)/(0.9+0.6);
-  return movingAverage(fused);
+float getDistanceLeft(){
+  return readUltrasonic(TRIG_L, ECHO_L);
+}
+
+float getDistanceRight(){
+  return readUltrasonic(TRIG_R, ECHO_R);
 }
 
 // ---------------- SPEED ----------------
@@ -193,45 +207,87 @@ void headingPID(float target){
 }
 
 // ---------------- ESP-NOW ----------------
-void onReceive(const uint8_t *mac,const uint8_t *data,int len){
-  memcpy(&otherVehicle,data,sizeof(otherVehicle));
+
+// Receive callback (already updated)
+void onReceive(const esp_now_recv_info *info, const uint8_t *data, int len){
+  if(len == sizeof(VehicleData)){
+    memcpy(&otherVehicle, data, sizeof(otherVehicle));
+  }
 }
+
+// ✅ SEND CALLBACK (PLACE HERE, OUTSIDE setup)
+void onSend(const wifi_tx_info_t *info, esp_now_send_status_t status){
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "TX OK" : "TX FAIL");
+}
+
 
 void sendData(){
   esp_now_send(peerMAC,(uint8_t*)&myData,sizeof(myData));
 }
 
 // ---------------- CONTROL ----------------
-void controlLogic(){
+void controlLogic(float dist){
 
-  float dist = getDistance();
   float speed = getSpeed();
-  float relSpeed = speed - otherVehicle.speed;
 
-  float ttc = (relSpeed>0)? dist/relSpeed : 999;
+  // ✅ DATA VALIDITY CHECK
+  if(!isDataFresh()){
+    stopMotors();
+    return;
+  }
+
+  float relSpeed = speed - otherVehicle.speed;
+  float ttc = (relSpeed > 0.1) ? dist / relSpeed : 999;
 
   if(emergencyFlag || otherVehicle.emergency){
     stopMotors();
     return;
   }
 
-  if(!deviated && dist<20){
+  if(!deviated && dist < 20){
     pathHeading = currentHeading;
     deviated = true;
   }
 
-  if(ttc<2 || dist<20){
+  if(ttc < 2 || dist < 20){
 
     stopMotors();
 
-    if(vehicleID < otherVehicle.vehicleID) turnLeft();
-    else turnRight();
+    float headingDiff = otherVehicle.heading - currentHeading;
 
+    if(headingDiff > 180) headingDiff -= 360;
+    if(headingDiff < -180) headingDiff += 360;
+
+    // ✅ SIDE SENSORS
+    float leftDist = getDistanceLeft();
+    delay(10);
+    float rightDist = getDistanceRight();
+
+    // 🚫 BOTH SIDES BLOCKED
+    if(leftDist < 10 && rightDist < 10){
+      stopMotors();
+      return;
+    }
+
+    // ✅ SMART DECISION (HEADING + SPACE)
+    if(headingDiff > 0 && rightDist > 15){
+      turnRight();
+    }
+    else if(headingDiff < 0 && leftDist > 15){
+      turnLeft();
+    }
+    else{
+      // fallback: choose freer side
+      if(leftDist > rightDist) turnLeft();
+      else turnRight();
+    }
   }
+
   else if(deviated){
     headingPID(pathHeading);
-    if(abs(currentHeading-pathHeading)<5) deviated=false;
+    if(abs(currentHeading - pathHeading) < 5) deviated = false;
   }
+
   else{
     moveForward();
   }
@@ -244,7 +300,8 @@ void setup(){
 
   pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT);
   pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
-  pinMode(TRIG,OUTPUT); pinMode(ECHO,INPUT);
+  pinMode(TRIG_L,OUTPUT); pinMode(ECHO_L,INPUT);
+  pinMode(TRIG_R,OUTPUT); pinMode(ECHO_R,INPUT);
 
   Wire.begin(21,22);
 
@@ -259,22 +316,24 @@ void setup(){
   gpsSerial.begin(9600,SERIAL_8N1,16,17);
 
   WiFi.mode(WIFI_STA);
-  esp_now_init();
+  if (esp_now_init() != ESP_OK) {
+  Serial.println("ESP-NOW INIT FAILED");
+  return;
+  }
 
   // Receive callback
   esp_now_register_recv_cb(onReceive);
-
-  // ✅ ADD THIS BLOCK
-  esp_now_register_send_cb([](const uint8_t*, esp_now_send_status_t s){
-    Serial.println(s == ESP_NOW_SEND_SUCCESS ? "TX OK" : "TX FAIL");
-  });
+  esp_now_register_send_cb(onSend);
 
   // Add peer
   esp_now_peer_info_t peer;
   memcpy(peer.peer_addr, peerMAC, 6);
+  memset(&otherVehicle, 0, sizeof(otherVehicle));
   peer.channel = 0;
   peer.encrypt = false;
-  esp_now_add_peer(&peer);
+  if (esp_now_add_peer(&peer) != ESP_OK) {
+  Serial.println("Peer Add Failed");
+}
 
   lastTime = millis();
 }
@@ -287,8 +346,8 @@ void loop(){
   while(gpsSerial.available()){
     gps.encode(gpsSerial.read());
   }
-
-  controlLogic();
+  float dist = getDistance();
+  controlLogic(dist);
 
   if(gps.location.isValid()){
     myData.lat = gps.location.lat();
@@ -297,10 +356,11 @@ void loop(){
 
   myData.heading = currentHeading;
   myData.speed = getSpeed();
-  myData.distance = getDistance();
+  myData.distance = dist;
   myData.emergency = emergencyFlag;
   myData.vehicleID = vehicleID;
 
+  myData.timestamp = millis();
   sendData();
 
   delay(50);
