@@ -1,1 +1,0 @@
-a fully independent system which detects when a driver is sleepy/sleeping and then automatically stops the engine and using tech similar to adas self parks it to the right of the lane with emergency lights
