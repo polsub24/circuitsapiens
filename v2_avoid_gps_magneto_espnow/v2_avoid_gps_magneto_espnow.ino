@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <QMC5883LCompass.h>
+#include "esp_wifi.h"
 
 // ---------------- GPS ----------------
 TinyGPSPlus gps;
@@ -34,81 +35,97 @@ typedef struct {
 
 VehicleData leaderData;
 
+// ---------------- MONITOR ----------------
+unsigned long lastReceiveTime = 0;
+
+// ---------------- RECEIVE ----------------
+void onReceive(const esp_now_recv_info *info, const uint8_t *data, int len) {
+  if(len == sizeof(VehicleData)){
+    memcpy(&leaderData, data, sizeof(leaderData));
+    lastReceiveTime = millis();
+
+    Serial.println("DATA RECEIVED");
+  }
+}
+
 // ---------------- MOTOR ----------------
 void moveForward(){
+  Serial.println("FORWARD");
   digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW);
   digitalWrite(IN3,HIGH); digitalWrite(IN4,LOW);
 }
 
 void stopMotors(){
+  Serial.println("STOP");
   digitalWrite(IN1,LOW); digitalWrite(IN2,LOW);
   digitalWrite(IN3,LOW); digitalWrite(IN4,LOW);
 }
 
 void turnRight(){
+  Serial.println("RIGHT");
   digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW);
   digitalWrite(IN3,LOW);  digitalWrite(IN4,HIGH);
 }
 
 void turnLeft(){
+  Serial.println("LEFT");
   digitalWrite(IN1,LOW);  digitalWrite(IN2,HIGH);
   digitalWrite(IN3,HIGH); digitalWrite(IN4,LOW);
 }
 
-// ---------------- RECEIVE (FIXED) ----------------
-void onReceive(const esp_now_recv_info *info, const uint8_t *data, int len) {
-
-  if(len == sizeof(VehicleData)){
-    memcpy(&leaderData, data, sizeof(leaderData));
-
-    // Debug print (optional but useful)
-    Serial.print("RX Heading: ");
-    Serial.print(leaderData.heading);
-    Serial.print(" | GPS Valid: ");
-    Serial.println(leaderData.gpsValid);
-  }
-}
-
-// ---------------- DISTANCE ----------------
+// ---------------- SENSORS ----------------
 float getDistanceFront(){
   VL53L0X_RangingMeasurementData_t m;
   lox.rangingTest(&m,false);
   return (m.RangeStatus!=4)? m.RangeMilliMeter/10 : 999;
 }
 
-// ---------------- HEADING ----------------
 float getHeading(){
   compass.read();
   return compass.getAzimuth();
 }
 
-// ---------------- FOLLOW LOGIC ----------------
+// ---------------- FOLLOW LOGIC (FIXED) ----------------
 void followLeader(){
-
-  if(!leaderData.gpsValid){
-    stopMotors();
-    return;
-  }
 
   float myHeading = getHeading();
   float error = leaderData.heading - myHeading;
 
-  // Normalize error
+  // Normalize
   if(error > 180) error -= 360;
   if(error < -180) error += 360;
 
-  Serial.print("Heading Error: ");
+  Serial.print("Error: ");
   Serial.println(error);
 
-  // Alignment phase
-  if(abs(error) > 10){
-    if(error > 0) turnRight();
-    else turnLeft();
+  float Kp = 1.0;  // tuning parameter
+  int baseSpeed = 120;
+
+  // ---------------- HEADING CONTROL ----------------
+  if(abs(error) > 25){
+    int turnSpeed = constrain(abs(error) * Kp, 80, 150);
+
+    analogWrite(ENA, turnSpeed);
+    analogWrite(ENB, turnSpeed);
+
+    if(error > 0){
+      turnRight();
+    } else {
+      turnLeft();
+    }
+
+    delay(40); // stabilize
     return;
   }
 
-  // Distance control
+  // ---------------- FORWARD MOVEMENT ----------------
+  analogWrite(ENA, baseSpeed);
+  analogWrite(ENB, baseSpeed);
+
   float dist = getDistanceFront();
+
+  Serial.print("Distance: ");
+  Serial.println(dist);
 
   if(dist > 20){
     moveForward();
@@ -124,11 +141,10 @@ void setup(){
   pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT);
   pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
 
-  // PWM using analogWrite ONLY
   pinMode(ENA, OUTPUT);
   pinMode(ENB, OUTPUT);
-  analogWrite(ENA, 255);
-  analogWrite(ENB, 255);
+  analogWrite(ENA, 120);
+  analogWrite(ENB, 120);
 
   Wire.begin(21,22);
   lox.begin();
@@ -136,11 +152,13 @@ void setup(){
   gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
   compass.init();
 
-  // ESP-NOW
+  // ---------------- ESP-NOW ----------------
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW INIT FAILED");
+    Serial.println("ESP INIT FAILED");
     return;
   }
 
@@ -160,10 +178,20 @@ void loop(){
     gpsLocked = true;
   }
 
+  // ---------------- FAILSAFE ----------------
+  if(millis() - lastReceiveTime > 2000){
+    Serial.println("LOST LEADER");
+    stopMotors();
+    delay(100);
+    return;
+  }
+
+  // ---------------- MAIN ----------------
   if(gpsLocked && leaderData.gpsValid){
     followLeader();
   }
   else{
+    Serial.println("WAITING...");
     stopMotors();
   }
 

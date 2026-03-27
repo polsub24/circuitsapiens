@@ -165,7 +165,7 @@ void setup(){
   Serial.println("🚀 System Booted");
   Serial.println("Waiting for GPS lock...");
 
-  analogWrite(ENA, 80);
+  analogWrite(ENA, 60);
   analogWrite(ENB, 255);
 }
 

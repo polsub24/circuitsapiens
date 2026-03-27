@@ -161,8 +161,8 @@ void setup(){
   Wire.begin(21,22);
   lox.begin();
 
-  analogWrite(ENA, 255);
-  analogWrite(ENB, 255);
+  analogWrite(ENA, 100);
+  analogWrite(ENB, 100);
 
   Serial.println("System Initialized. Waiting for GPS...");
 }
