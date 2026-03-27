@@ -2,6 +2,16 @@
 #include "Adafruit_VL53L0X.h"
 #include <esp_now.h>
 #include <WiFi.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------------- OLED ----------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+String oledStatus="INIT", oledTX="-", oledRX="-";
+int oledRSSI=0;
 
 // ---------------- MOTOR ----------------
 #define IN1 25
@@ -17,25 +27,26 @@
 #define TRIG_R 13
 #define ECHO_R 14
 
-Adafruit_VL53L0X lox = Adafruit_VL53L0X();
+Adafruit_VL53L0X lox;
 
 // ---------------- FILTER ----------------
 #define N 5
-float distBuffer[N] = {0};
-int idx = 0;
+float distBuffer[N]={0};
+int idx=0;
 
 // ---------------- V2V ----------------
 typedef struct {
   float frontDist;
-  int state; // 0 stop, 1 move, 2 obstacle
+  int state;
 } VehicleData;
 
 VehicleData sendData, recvData;
+bool dataReceived = false;
 
-// 🔴 PUT V2 MAC HERE
-uint8_t peerMAC[] = {0xAF,0xF0,0x0F,0x5C,0x41,0xA4};
+// 🔴 PUT V1 MAC HERE
+uint8_t peerMAC[] = {0x14,0x33,0x5C,0x0B,0x23,0xAC};
 
-// ---------------- MOTOR CONTROL ----------------
+// ---------------- MOTOR ----------------
 void moveForward(){
   digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW);
   digitalWrite(IN3,HIGH); digitalWrite(IN4,LOW);
@@ -46,10 +57,10 @@ void stopMotors(){
 }
 void turnRight(){
   digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW);
-  digitalWrite(IN3,LOW);  digitalWrite(IN4,HIGH);
+  digitalWrite(IN3,LOW); digitalWrite(IN4,HIGH);
 }
 void turnLeft(){
-  digitalWrite(IN1,LOW);  digitalWrite(IN2,HIGH);
+  digitalWrite(IN1,LOW); digitalWrite(IN2,HIGH);
   digitalWrite(IN3,HIGH); digitalWrite(IN4,LOW);
 }
 
@@ -62,89 +73,120 @@ float movingAverage(float val){
   return sum/N;
 }
 
-// ---------------- SENSORS ----------------
-long readUltrasonic(int trig, int echo){
+// ---------------- ULTRASONIC ----------------
+long readUltrasonic(int trig,int echo){
   digitalWrite(trig,LOW); delayMicroseconds(2);
   digitalWrite(trig,HIGH); delayMicroseconds(10);
   digitalWrite(trig,LOW);
+
   long duration = pulseIn(echo,HIGH,20000);
+
+  if(duration == 0) return 200;   // ✅ FIX: treat no echo as clear path
+
   return duration * 0.034 / 2;
 }
 
+// ---------------- DISTANCE ----------------
 float getDistanceFront(){
   VL53L0X_RangingMeasurementData_t m;
   lox.rangingTest(&m,false);
-  int tof = (m.RangeStatus!=4)? m.RangeMilliMeter/10 : 999;
+  int tof=(m.RangeStatus!=4)?m.RangeMilliMeter/10:999;
   return movingAverage(tof);
 }
 
-float getDistanceLeft(){ return readUltrasonic(TRIG_L, ECHO_L); }
-float getDistanceRight(){ return readUltrasonic(TRIG_R, ECHO_R); }
+float getDistanceLeft(){ return readUltrasonic(TRIG_L,ECHO_L); }
+float getDistanceRight(){ return readUltrasonic(TRIG_R,ECHO_R); }
 
-// ---------------- ESP-NOW ----------------
-void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
-  
-  memcpy(&recvData, incomingData, sizeof(recvData));
-
-  Serial.print("Received from: ");
-  for(int i=0;i<6;i++){
-    Serial.printf("%02X", info->src_addr[i]);
-    if(i<5) Serial.print(":");
-  }
-
-  Serial.print(" | Dist: ");
-  Serial.print(recvData.frontDist);
-  Serial.print(" | State: ");
-  Serial.println(recvData.state);
+// ---------------- OLED ----------------
+void updateOLED(float dist,int state){
+  display.clearDisplay();
+  display.setCursor(0,0); display.print("F:"); display.println(dist);
+  display.setCursor(0,10); display.print("S:"); display.println(state);
+  display.setCursor(0,20); display.print("TX:"); display.println(oledTX);
+  display.setCursor(0,30); display.print("RX:"); display.println(oledRX);
+  display.setCursor(0,40); display.print("RSSI:"); display.println(oledRSSI);
+  display.setCursor(0,50); display.print("Act:"); display.println(oledStatus);
+  display.display();
 }
 
-void sendVehicleData(float dist, int state){
-  sendData.frontDist = dist;
-  sendData.state = state;
-  esp_now_send(peerMAC, (uint8_t *)&sendData, sizeof(sendData));
+// ---------------- ESP-NOW ----------------
+void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status){
+  oledTX = (status==ESP_NOW_SEND_SUCCESS)?"OK":"FAIL";
+}
+
+void OnDataRecv(const esp_now_recv_info_t *info,const uint8_t *data,int len){
+  memcpy(&recvData,data,sizeof(recvData));
+  oledRX=String(recvData.frontDist,1)+","+String(recvData.state);
+  oledRSSI=info->rx_ctrl->rssi;
+  dataReceived = true;
+}
+
+void sendVehicleData(float dist,int state){
+  sendData.frontDist=dist;
+  sendData.state=state;
+  esp_now_send(peerMAC,(uint8_t*)&sendData,sizeof(sendData));
 }
 
 // ---------------- CONTROL ----------------
-// ONLY CHANGE IS CONTROL LOGIC DIFFERENCE
-
 void controlLogic(float dist){
 
-  float leftDist = getDistanceLeft();
+  float left=getDistanceLeft();
   delay(10);
-  float rightDist = getDistanceRight();
+  float right=getDistanceRight();
 
-  int myState = 1;
+  // Debug (optional)
+  Serial.print("L: "); Serial.print(left);
+  Serial.print(" R: "); Serial.println(right);
 
-  if(dist < 10){
-    stopMotors();
-    sendVehicleData(dist, 0);
-    delay(200);
+  // Immediate obstacle
+  if(dist<10){
+    stopMotors(); oledStatus="STOP";
+    sendVehicleData(dist,0);
+    updateOLED(dist,0);
     return;
   }
 
-  if(dist < 400){
-    myState = 2;
+  // Obstacle avoidance
+  if(dist<400){
+    if(left>10 && left>right){
+      turnLeft(); oledStatus="LEFT";
+    }
+    else if(right>10){
+      turnRight(); oledStatus="RIGHT";
+    }
+    else{
+      // ✅ FIX: escape instead of freeze
+      oledStatus="ESCAPE";
+      turnRight();
+      delay(200);
+    }
 
-    if(leftDist > rightDist && leftDist > 15) turnLeft();
-    else if(rightDist > 15) turnRight();
-    else { stopMotors(); myState = 0; }
-
-    sendVehicleData(dist, myState);
-    delay(200);
+    sendVehicleData(dist,2);
+    updateOLED(dist,2);
     return;
   }
 
-  // 🔥 STRONGER FOLLOWER LOGIC
-  if(recvData.frontDist < 80 || recvData.state == 0){
-    stopMotors();
-    sendVehicleData(dist, 0);
-    delay(100);
+  // No V1 data yet → move forward
+  if(!dataReceived){
+    moveForward(); oledStatus="SEARCH";
+    sendVehicleData(dist,1);
+    updateOLED(dist,1);
     return;
   }
 
-  moveForward();
-  sendVehicleData(dist, 1);
+  // FOLLOW LOGIC
+  if(recvData.frontDist < 30){
+    stopMotors(); oledStatus="FOLLOW STOP";
+    sendVehicleData(dist,0);
+    updateOLED(dist,0);
+    return;
+  }
+
+  moveForward(); oledStatus="FOLLOW";
+  sendVehicleData(dist,1);
+  updateOLED(dist,1);
 }
+
 // ---------------- SETUP ----------------
 void setup(){
   Serial.begin(115200);
@@ -155,29 +197,32 @@ void setup(){
   pinMode(TRIG_L,OUTPUT); pinMode(ECHO_L,INPUT);
   pinMode(TRIG_R,OUTPUT); pinMode(ECHO_R,INPUT);
 
-  pinMode(ENA, OUTPUT);
-  pinMode(ENB, OUTPUT);
+  pinMode(ENA,OUTPUT); pinMode(ENB,OUTPUT);
 
   Wire.begin(21,22);
   lox.begin();
 
-  analogWrite(ENA, 200);
-  analogWrite(ENB, 200);
+  analogWrite(ENA,180);
+  analogWrite(ENB,180);
 
-  // ESP-NOW
+  display.begin(SSD1306_SWITCHCAPVCC,0x3C);
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
   WiFi.mode(WIFI_STA);
   esp_now_init();
 
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, peerMAC, 6);
+  esp_now_peer_info_t peerInfo={};
+  memcpy(peerInfo.peer_addr,peerMAC,6);
   esp_now_add_peer(&peerInfo);
 
   esp_now_register_recv_cb(OnDataRecv);
+  esp_now_register_send_cb(OnDataSent);
 }
 
 // ---------------- LOOP ----------------
 void loop(){
-  float dist = getDistanceFront();
+  float dist=getDistanceFront();
   controlLogic(dist);
   delay(50);
 }
