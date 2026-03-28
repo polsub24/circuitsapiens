@@ -101,8 +101,3 @@ Each vehicle provides real-time feedback including:
 - Cloud/edge integration for fleet-level intelligence  
 - Real-time mapping and localization  
 
----
-
-## 📜 License
-
-This project is open-source and available under the MIT License.
